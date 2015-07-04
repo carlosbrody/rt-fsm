@@ -1,0 +1,1 @@
+A finite state machine for running control applications under RTAI.
