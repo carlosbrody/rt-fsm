@@ -1,0 +1,281 @@
+These are notes I made when I made an effort to understand the RTLinux code so as to modify it.
+
+At first is a pseudo-code description of fsm.c, the kernel module that runs real-time.
+
+Next is a description of communication between FSMServer.cpp, the user-level code that communicates with Matlab, 
+and that passes Matlab messages down to the kernel.
+
+Last is a description of how to add new commands to the state machine.
+
+======================
+
+
+fsm.c:
+
+DOFSM:
+
+static void *doFSM(void *arg)
+
+- set &rt_task_running to 1.
+- while &rt_task_stop==0,
+
+	- clear expired trigger outputs
+
+	- get all IO inputs
+
+   - for each state machine f,
+
+        - mark current time
+
+        - handleFifos(f) : this deals with messages from the Linux user-space (FSMServer.cpp)
+
+        - if state machine is unlocked (its valid flag == 1)
+
+	- clear input events bits : detectInputEvents(f)
+
+	- check for a forced tup (mark in local flag "got_timeout"); 
+	  check for a forced transition (mark in input event bits)
+
+	- call embedded C tick function if it exists
+
+	- check whether this state has timed out; if so, set got_timeout flag to 1.
+
+	-detectInputEvents(f) : this loops through input channels and sets necessary
+	    bits in the event bit mask
+
+	-detectSimulatedInputEvents(f, &got_timeout) : as detectInputEvents but for 
+	   the emulator, perhaps? Or maybe for any events set by embedded C stuff?
+	   Looks like its the emulator.
+
+	-processSchedWaves(f) : do regular sched waves steps. This may set
+	   some of our input events bits. However, triggering/untriggering of sched waves is 
+	   handled by scheduleWave() below (under doOutput() under dispatchEvent()).
+	      The function processSchedWaves(f) loops through active waves. 
+	      ffs() stands for find first set bit, and __ffs(x) = ffs(x)-1, so that if the first bit
+	      set is the least significant bit, this comes back as a wave_id of wave 0 (which is
+	      a valid wave id).
+
+	-processSchedWavesAO(f) : do analog output sched waves steps. This may set
+	   some of our input events bits
+		
+	- if got_timeout==1
+		fsmEventPush : register the timeout event in our list of events
+		gotoState : jump to the state indicated by the timeout event
+	
+	- for bits in the inputs event bitmask : loop serially through all events
+		dispatchEvent(f, evt_id) : registers event and goes to state pointed to 
+			if necessary:
+			does fsmEventPush(f, FSM_EVT_TYPE_IN, event_id)
+			does gotoState(f, next_state, event_id)
+			    does historyPush(f, event_id)
+			    does CALL_EMBC
+			    does doOutput(f)			    
+				does ouput for various spects, including:
+				does fsmEventPush(f, spec->type, col i, output o)
+				does do SchedWaveOutput			
+				    does scheduleWave(f, wave, op)
+					triggers and untriggers the wave : sets active_wave_mask
+					and sets the absolute timestamps of when the various wave events
+					will occur, based on current timestamp plus preamble, sustain, and refraction.
+
+
+        - end if machine is unlocked
+
+   - end for each state machine
+
+   - commitDIOWrites : send outputs to real world. If there are forced outputs set by the 
+	governing machine, they are implemented here.
+
+   - doDAQ() :
+
+   - some debugging time tallies.
+
+   - sleep until next wakeup
+
+-end while rt_task_stop != 0
+
+
+
+
+
+
+
+
+/******** COMMUNICATION ***********/
+
+The recipe for adding a new command from scratch is below (see "ADDING A NEW COMMAND FROM SCRATCH"). To understand what you're doing, though, it's recommended that you read the stuff before that section too.
+
+(For clarity, code chunks below are referred to as "FSMServer.cpp" and "fsm.c". These files are of course source code, not executables. The extension is used here to help remember that FSMServer is written in C++ and runs in Linux user space; RatExpFSM is written in C and runs in real-time kernel space; it's main source file is fsm.c.)
+
+The top-level is in FSMServer.cpp. This thread receives messages from the Matlab process and then sends them down to the fsm.c kernel process.
+
+In FSMServer.cpp, ConnectionThread::threadFunc is the routine that takes messages from the Matlab Client and repackages them into ShmMsg structures for fsm.c. The message IDs that go from FSMServer.cpp -> fsm.c are defined in FSM.h, in "enum ShmMsgID". The struct ShmMsg (also defined in FSM.h) is a union of a variety of elements that can be set when a message is being sent. Messages are instantiations of this ShmMsg structure.
+
+One particularly important message occurs when a State Matrix is sent. This matrix is preceded by some control parameters; FSMServer.cpp sends those, then waits for a "READY" response from the fsm.c kernel; it then sends the matrix. Weirdly and uncomfortably, Matlab sendsthe specs for the Scheduled Waves (i.e., their preamble time, etc.) packaged as consecutive items at the end of the State Matrix. So a single rectangular matrix gets sent from Matlab to FSMServer.cpp that inludes the state matrix and the sched wave specs, even though the last few rows of that state matrix are not really arranged in rows at all and have a meaning totally different to the first rows (since the last rows are sched wave specs).
+
+    FSMServer.cpp: some subfunctions useful to know about:
+    
+    ConnectionThread::matrixToRT(const Matrix & m, unsigned numEvents, unsigned numSchedWaves, etc.)  (note that this fn name is overloaded).
+       This is the one that unpackages the FSMspec, including sched wave info, from a rectangular matrix form from Matlab into FSMSpec and SchedWave structure forms, within a msg, and then, at the end of unpackaging, sends it down to fsm.c using sendToRT(msg)
+.
+    There is also a function, parseSchedWaveSpecStr() that looks like it might be responsible for dealing with unpacking scheduled waves, but I don't know when or how it's called. doSetStateProgram() calls it-- this function parseSchedWaveSpecStr() might be part of the the updated version of things, for using embedded C. 
+
+       /****** COMMUNICATION: handleFifos() *********/
+
+static void handleFifos(FSMID_t f)
+
+This is the function that deals with input signals from the user space (<--> governing machine). For commands that might be slow to execute, this is done by sending them to a "buddy task" running in parallel, sharing namespace with fsm.c but not running real-time. One buddy task per fsm. See below for much more on the buddy task system. handleFifos() also sometimes sends answers back to user space. 
+
+handleFifos() has the option to lock the fsm while it is processing. It does so by setting "rs[f].valid=0;". I'm not sure why we need this, since we are running serially-- could the kernel start another doFSM() thread in parallel, or does it restart us wherever we were? In any event, for some calls, handleFifos() starts by setting rs[f].valid = 0, which means that doFSM() does nothing on state machine f, and handleFifos() ends by setting rs[f].valid=1, opening it up for action again.
+
+
+
+       /****** COMMUNICATION: handleFifos() and the BUDDY TASK system *********/
+
+One difficult issue is that sometimes the user may send a command request through the Fifo whose execution will take more than a single FSM clock cycle. This means that the RT process can't just reply serially; if we do that, we'll miss clock cycles on processing the state machine.
+
+To address this, Calin created the soft buddy task system. I'm not quite sure how it manages to do its magic, but its pretty magical! It is like a process that runs concurrently with fsm.c, but does so *not* in real time. Nevertheles, it is within the kernel and within fsm.c's namespace-- so all the globals that are declared in fsm.c, such as the fsm specs themselves, etc. are also available to the buddy task code and process. The buddy task's source code is in the same source code file as the realtime kernel code-- that is, it is in fsm.c: it is the function buddyTaskHandler(). (The overall setup framework code for the buddy task system is elsewhere, it is in softtask.c and softtask.h in the kernel/ directory.)
+
+In other words, the buddy task system is yet another layer of client-server communication. When messages arrive in the kernel, and are handled in handleFifos(), those messages that might take a long time are sent to the buddy task for handling, and flow exits from handleFifos(). When called in subsequent cycles, handleFifos() will refuse to do anything until it has gotten the message that the buddy task is finished with the task sent to it (it is a serial Fifo, we don't start dealing with the next message until done with the current one). Once the buddy task is done, we're good to go again. Pretty neat. Long duration commands become no problem, we just need to send them to the buddy task.
+
+In more detail: Each FSM has one buddy task to help it. There is a global vector, buddyTaskCmds, that has one entry per FSM. The entry for each FSM is the command id (using the same message ids as in the struct ShmMsg messages that go between FSMServe.cpp and fsm.c) that the buddy task is executing. A 0 here means the buddy task isn't doing anything; a positive number is the command id; and a negative number means "done with this command id".
+   At the top of handleFifos(), a number of macros are defined that help work with this system; the macro BUDDY_TASK_PEND simply means "set the buddyTaskCmds entry for this fsm, f, to the indicated command, and register with softtask that the buddy task for this fsm f has stuff to do." When a command is sent this way, through BUDDY_TASK_PEND the code that will pick up that command and work with it is in the function buddyTaskHandler(f). In there, you'll see a switch statement for the various message ids that it knows how to handle. Because the buddy task shares memory and namespace with fsm.c, we don't have to send any data to the buddy task handler, it works directly with fsm.c's variables. And we don't worry about waking up/not waking up, the buddy task handler runs in asynchronous non-realtime mode, we just run serially and we're done with it, the OS takes care of scheduling us. At the end of buddyTaskHandler, we set buddyTaskCmds[f] to be the negative of the command we were given. This means "buddy task done with this command!"
+   Now, remember that handleFifos(f) runs once every FSM clock cycle. Within handleFifos(f), the structure is (1) ask whether our buddy task is busy; if so, return without doing anything; (2) if the buddy task is not busy, ask whether it has just finished a command? If so, wrap up any processing we might still want to do for that command, and send a reply to FSMserver.cpp saying we're done with the command (in handleFifos(), we set the variable do_reply=1); and do BUDDY_TASK_CLEAR so our buddy task no longer registers as busy. For the wrap-up processing, we do a switch on BUDDY_TASK_RESULT that lets us deal with the different command ids. (3) if the buddy task was neither busy nor had just finished, then we don't worry about the buddy system, and we're free to look and see if there are incoming messages pending on the user fifo. If there are, we deal with them. For things we can deal with immediately, we do so and we set do_reply=1. For things we can't do quickly, we call BUDDY_TASK_PEND and we don't set do_reply yet, that'll happen in subsequent cycles when we detect the buddy task is done. At the very end of handleFifos(), if we have a reply for the user (either because it was an immediate command or because we just detected the buddy task was done with a command), we put the reply out on the user fifo, and we're done. (In the code, Calin also undefined the buddy task macros at this point for cleanliness).
+
+      /********  COMMUNICATION:  ADDING A NEW COMMAND FROM SCRATCH *********/
+
+To add a new user->kernel command, then, you need to do the following (a recent example you can look at is GETINPUTCHANNELEVENTS):
+
+   (1) Write a Matlab method in @RTLSM2/ that sends the command. Typically this code 
+        will use FSMClient, or will use wrappers such as DoQueryCmd or DoQueryMatrixCmd, etc. 
+	For this Matlan method, you can use a command id that has spaces in it, e.g., 
+	"MY NEW COMMAND". You don't have to declare this string anywhere else at the Matlab 
+	client level; below you will add code to FSMServer.cpp that tells it how to recognize and 
+	deal with your new string.
+
+   (2) In FSM.h, go to enum ShmMsgID and add a new id. This one cannot have spaces in it, 
+       	so you could call it, say, MYNEWCOMMAND. This is for communicating 
+	between FSMServer.cpp<->fsm.c (meaning, Linux userspace<->RT kernel).
+
+   (3) In FSM.h, also for communicating between FSMServer.cpp<->fsm.c go to struct ShmMsg 
+        and add whatever you need to the union for your messaging. For example, you could add 
+       	  struct {
+	  	 double myvector[24];
+          } newcommand;
+	This would mean that in the messages going between user and kernel space, you would have 
+	a structure named newcommand that contains a vector of 24 doubles, therefore making twenty-four 
+	doubles like msg.u.newcommand.myvector[j] available to you.
+
+   (4) In FSMServer.cpp, go to ConnectionThread::threadFunc() and add a new case there, using 
+        "if line.find("MY NEW COMMAND") " like all the other commands do.  At the top of that new code, 
+	you should set msg.id = MYNEWCOMMAND". You can also set anything else you need-- e.g., you 
+	could set values of the  doubles in your newcommand structure within msg. 
+	   Then call "sendToRT(msg)". When this returns, the msg structure will have any reply that the kernel
+	 made. For example, the kernel may have modified your doubles vector.
+	    If you need to send a contentful reply back to Matlab (i.e., more than just "OK"), define a stringstream or 
+	 ostringstream, fill it with your message, and send it to Matlab using sockSend(str).
+	 If you're happy with everything so far, set "cmd_error = false". (This will automatically send an "OK" line 
+	 back to the Client after any reply you made above.)
+	 
+	 That's the end of the [ if line.find("MY NEW COMMAND") ] code bit, and the end of what you need to do
+	 in FSMServer.cpp.
+
+   (5) In fsm.c, go to handleFifos(). Search for the comment " !BUDDY_TASK_BUSY " (note the exclamation mark,
+         i.e., buddy task is NOT busy) Below that, you'll find the code for handling messages from user space. 
+	 Add a new "case MYNEWCOMMAND: " section there.
+
+	If it is a quick command, do whatever needs doing, putting any reply to the user in msg (for example,
+	"msg->u.newcommand.myvector[0] = 10;"), and end with "do_reply=1". That's it, you're done.
+
+	If the command might be a slow one, instead of dealing with it here, you want to send it to the buddy
+	task. In that case, here's what you do: 
+
+	   (5.1) within the case MYNEWCOMMAND section that you were writing, do anything you need to do
+	   before sending the command to the buddy task handler. E.g., reformat stuff in msg, anything quick.
+
+	   (5.2) at the end of your case MYNEWCOMMAND, call "BUDDY_TASK_PEND(MYNEWCOMMAND)". Don't
+	   set do_reply=1 here after that, the reply should not be made until the buddy task is finished.
+
+	   (5.3) go to the function buddyTaskHandler(). Add **another** case MYNEWCOMMAND: section there. 
+	   Within that, do whatever needs doing to process your command. You have msg->u available to you, f 
+	   indicates the current FSM id that you're dealing with, and you also have all the globals, e.g., rs[f]-- 
+	   everything you would have had within handleFifos(). Remember that while you're processing here, the FSM
+	   task will be running concurrently. Also remember that at this level, replies you want to send to the 
+	   FSMServer.cpp space are made by changing the content of msg->u. (This doesn't include the automatic 
+	   "OK" reply, that is at a different level, from FSMServer.cpp to the client, and it is automatic, you don't 
+	   need to worry about that one.) Once you're done here, you don't need to do more in buddyTaskHandler().
+
+	   (5.4) go back to handleFifos(). This time go to the top part of the function, and look for "
+	   switch(BUDDY_TASK_RESULT)". Within that switch statement, add **another** case MYNEWCOMMAND
+	   section. This is what will get run, within the kernel and in real-time, once the buddy task has finished
+	   with your new command. Here you can wrap up anything else you want to do after the buddy task is done
+	   with your command (as long as what you're doing here is quick). For many commands, you don't need to 
+	   do anything here, you've done it all in the buddy task space, so you simply set "do_reply=1".
+
+	   (5.5) That's it, you're done!! Run and enjoy.
+
+
+/******* SCHEDULED DIO WAVES ************/
+
+Data structures:
+
+Information about which waves are "active" or "inactive" is held in active_wave_mask; each bit there is 0 if the wave is inactive and 1 if the wave is active. Information about parameters defining a scheduled wave is held in a struct SchedWave (defined in FSM.h; one for each wave)-- this holds things that are constant over different runs of the wave, i.e., things like what the wave's preamble is, what it's sustain is, what it's DIO line if any is, etc. Information about a current run f a wave is held in struct ActiveWave active_wave[FSM_MAX_SCHED_WAVES] (defined in fsm.c). This one holds things that change over different runs of a wave: e.g., the absolute (not relative) time for when the wave's preamble should ends, whether the wave is currently in the sustain or not, etc.
+
+Functions:
+
+There are two main functions that handle scheduled DIO waves. 
+
+The first is processScheduledWaves(). This function is called early in doFSM(), before event bits are set. It runs over all active waves. For each wave, it checks to see if their preamble time has passed; if so, it sets any event bits or DIO lines or anything else that should go with a _In event; it then checks to see if the sustain time has passed, and does whatever needs doing there; and it then checks to see whether the refraction time has passed and does whatever needs doing there (including setting the wave's active bit low if it is a non-looping wave).  At the end of this function, a check is made to see whether any wave has a wave_is_high flag on (meaning, it's in the middle of its sustain) but its active mask off. Waves like these are waves that were actively untriggered in the middle of their sustain, and need an _Out event generated. For these waves, the wave_is_high flag is set low again, and the _Out event bit (if the wave has an _Out channel) is set. (See next paragraph on scheduleWaveDIO()).
+
+The second function is scheduleWaveDIO(). This function is called as part of doOutput, which is part of dispatchEvent, which responds to high events bits. This function is the one responsible for making a wave active, and is the one that makes sure that if you try to retrigger a wave that is already running (make active an already active wave), you get ignored. If you ask to make a wave active, and it isn't already running, this function sets the corresponding active_wave_mask bit high, and adds preamble, sustain, and refraction times to the current time to set the absolute times of these events for the wave in its struct ActiveWave active_wave[wave_id] entry. State transitions that turn a wave off are handled here, too: the wave's active_wave_mask bit is set low. One issue that needs care is what happens when a wave is untriggered (made inactive) while it was in the sustain period. A corresponding _Out event bit needs to be set. But we can't set it here, because it may not be handled until the next clock tick, and at the beginning of each clock tick, doFSM turns all event bits off. To deal with this, we have a wave_is_high flag for every wave; a non-zero value here indicates the wave is in the middle of its sustain. When a wave is actively untriggered, scheduleWaveDIO sets its active_wave_mask bit low, but leaves the wave_is_high flag on. In the next clock tick, processSheduledWaves() will detect the mismatch between the active_wave_mask bit and the wave_is_high_flag, generate the _Out event bit, and turn off the wave_is_high flag. (See previous paragraph on processScheduledWaves()).
+
+
+
+/************* HOW THE MATRIX AND STATE FSM ARE SENT **************/
+
+As mentioned somewhere above,  everything is packed into a single rectangular matrix, and sent in from Matlab like that. Ugh!
+For a machine with S states, the first S rows correspond to states. The next row, (row S if the initial row is indexed at 0, as in C), is a row that indicates the input mappings: what DIO lines the input lines correspond to. Then the next rows are for scheduled waves-- as many rows as necessary, zero rows only if there are no scheduled waves at all. Note that each scheduled wave will not necessarily occupy a single row, so this is unpacked serially.
+
+Finally, we're going to add rows for event response elements at the end of all this, again, all packed serially. First, a number of elements equal to the number of states. Each of these will indicate how many event response elements for each state. The sum of these should be equal to total_event_response_elements. Next, the event response elements. Each one is composed of four integers. The first identifies what kind of input we're talking about (Digital line? Scheduled wave? Etc.). The second identifies which of these within the class we're talking about . (E.g., Digital line 3). The 3rd identifies what kind of event on the line we are lookig for (transition up? down? Being up? Down?). Finally, the fourth says what state to jump to if the condition is detected.
+
+
+---------
+
+enhancements:
+
+* Scheduled DIO waves can now loop; they can also turn other scheduled waves on or off.
+
+* The client can ask for the current state of input channels, not only transitions.
+
+bug fixes:
+
+* all scheduled waves should be stopped on start of a new trial (i.e., entering state 0). A typo was preventing that.
+
+* everything that a scheduled wave does when its sustain ends should also happen if the wave is actively untriggered
+  during its sustain: making a wave_Out event, untriggering any sounds, untriggering any other waves under its control.
+  This is now fixed.
+
+known bugs:
+
+* the end of a scheduled wave's sustain unlocks the DIO channel that wave was controlling; but the state of that DOut doesn't go to what is
+  prescribed by the current state, not until there is a state change. This is because doOutputs(f) is only called on a state change.
+
+
+
+
+/***************** NEW MODE *********************/
+
+We have a map of happening detector function names to happening detector function pointers. This map defines the user-available function names. At the beginning of sending a state matrix, in the same way that the user sends "input routing", we send a list of my_happening_names -> happening type specs. For example,{"Cin" -> event, happening detector func "line_in", parameter 1 (its input line id), happening_id 1}. Or another example, {"mywave_Hi" -> condition, happening detector func "wave_high", parameter 16 (i.e., wave id 16) and happening_id 22}.
+
+[For now, happening detector functions all take (FSMid_t f, int param) as parameters. Perhaps variable parameter lists, with user-defined types, could be implemented later].
+
+Using the above, we build our list of happening type specs for this state matrix.
+
+We then get the state-by-state list of happeningResponseElements : these map a happening name (e.g., "Cin") to a state to jump to. Each state may have more than one of these, of course.
+
+We have to figure out what's happening with the DIO line offset commands, since these will affect the line in id parameters 
+
+/****************/
+
+
+Idea for dynamically defining number of args to happeningDetectorFunctions: have spaces for say up to five args. Then do a switch statement on defined number of args, and call the function with a cast of the fn pointer to the appropriate number-of-args type of fn. 
